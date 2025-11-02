@@ -1,0 +1,285 @@
+/**
+ * lofi.fm Cloudflare Worker
+ * Handles API endpoints and routes WebSocket connections to Durable Objects
+ */
+
+import { Room } from './room';
+
+export { Room };
+
+interface Env {
+	ROOM: DurableObjectNamespace;
+	YOUTUBE_API_KEY: string;
+	ENVIRONMENT: string;
+}
+
+// Helper to generate room ID
+function generateRoomId(roomName: string): string {
+	const shortId = Math.random().toString(36).substring(2, 8);
+	return `${roomName}-${shortId}`;
+}
+
+// Helper to validate room name
+function isValidRoomName(name: string): boolean {
+	return /^[a-z0-9-]+$/i.test(name) && name.length >= 3 && name.length <= 32;
+}
+
+// CORS headers
+const corsHeaders = {
+	'Access-Control-Allow-Origin': '*',
+	'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
+	'Access-Control-Allow-Headers': 'Content-Type',
+};
+
+export default {
+	async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
+		const url = new URL(request.url);
+
+		// Handle CORS preflight
+		if (request.method === 'OPTIONS') {
+			return new Response(null, { headers: corsHeaders });
+		}
+
+		// Health check
+		if (url.pathname === '/' || url.pathname === '/health') {
+			return new Response(JSON.stringify({ status: 'ok', service: 'lofi.fm' }), {
+				headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+			});
+		}
+
+		// Create room
+		if (url.pathname === '/api/rooms/create' && request.method === 'POST') {
+			try {
+				const body = await request.json() as { roomName: string };
+				
+				if (!body.roomName || !isValidRoomName(body.roomName)) {
+					return new Response(
+						JSON.stringify({ 
+							error: 'Invalid room name. Use 3-32 alphanumeric characters and hyphens only.' 
+						}),
+						{ status: 400, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
+					);
+				}
+
+				const roomId = generateRoomId(body.roomName);
+				const durableObjectId = env.ROOM.idFromName(roomId);
+				const roomStub = env.ROOM.get(durableObjectId);
+
+				// Initialize room
+				await roomStub.fetch(new Request('http://internal/init', {
+					method: 'POST',
+					body: JSON.stringify({ roomId, roomName: body.roomName }),
+					headers: { 'Content-Type': 'application/json' },
+				}));
+
+				// Generate WebSocket URL
+				const wsUrl = `${url.protocol === 'https:' ? 'wss:' : 'ws:'}//${url.host}/api/rooms/${roomId}/ws`;
+
+				return new Response(
+					JSON.stringify({ 
+						roomId, 
+						roomName: body.roomName,
+						wsUrl 
+					}),
+					{ headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
+				);
+			} catch (error) {
+				return new Response(
+					JSON.stringify({ error: 'Failed to create room' }),
+					{ status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
+				);
+			}
+		}
+
+		// Get room info
+		if (url.pathname.startsWith('/api/rooms/') && url.pathname.endsWith('/info') && request.method === 'GET') {
+			try {
+				const roomId = url.pathname.split('/')[3];
+				const durableObjectId = env.ROOM.idFromName(roomId);
+				const roomStub = env.ROOM.get(durableObjectId);
+
+				const response = await roomStub.fetch(new Request('http://internal/state'));
+				const state = await response.json();
+
+				return new Response(JSON.stringify(state), {
+					headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+				});
+			} catch (error) {
+				return new Response(
+					JSON.stringify({ error: 'Room not found' }),
+					{ status: 404, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
+				);
+			}
+		}
+
+		// WebSocket connection
+		if (url.pathname.startsWith('/api/rooms/') && url.pathname.endsWith('/ws')) {
+			const roomId = url.pathname.split('/')[3];
+			const durableObjectId = env.ROOM.idFromName(roomId);
+			const roomStub = env.ROOM.get(durableObjectId);
+
+			return roomStub.fetch(request);
+		}
+
+		// YouTube search
+		if (url.pathname === '/api/youtube/search' && request.method === 'POST') {
+			try {
+				const body = await request.json() as { query: string; maxResults?: number };
+				
+				if (!body.query) {
+					return new Response(
+						JSON.stringify({ error: 'Query is required' }),
+						{ status: 400, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
+					);
+				}
+
+				const maxResults = Math.min(body.maxResults || 10, 20);
+				const apiUrl = new URL('https://www.googleapis.com/youtube/v3/search');
+				apiUrl.searchParams.set('part', 'snippet');
+				apiUrl.searchParams.set('q', body.query);
+				apiUrl.searchParams.set('type', 'video');
+				apiUrl.searchParams.set('maxResults', maxResults.toString());
+				apiUrl.searchParams.set('key', env.YOUTUBE_API_KEY);
+
+				const response = await fetch(apiUrl.toString());
+				const data = await response.json() as any;
+
+				if (!response.ok) {
+					throw new Error('YouTube API error');
+				}
+
+				// Get video durations
+				const videoIds = data.items.map((item: any) => item.id.videoId).join(',');
+				const detailsUrl = new URL('https://www.googleapis.com/youtube/v3/videos');
+				detailsUrl.searchParams.set('part', 'contentDetails');
+				detailsUrl.searchParams.set('id', videoIds);
+				detailsUrl.searchParams.set('key', env.YOUTUBE_API_KEY);
+
+				const detailsResponse = await fetch(detailsUrl.toString());
+				const detailsData = await detailsResponse.json() as any;
+
+				const results = data.items.map((item: any, index: number) => {
+					const duration = parseDuration(detailsData.items[index]?.contentDetails?.duration || 'PT0S');
+					return {
+						videoId: item.id.videoId,
+						title: item.snippet.title,
+						thumbnail: item.snippet.thumbnails.medium.url,
+						duration,
+						channelTitle: item.snippet.channelTitle,
+					};
+				});
+
+				return new Response(JSON.stringify({ results }), {
+					headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+				});
+			} catch (error) {
+				return new Response(
+					JSON.stringify({ error: 'Failed to search YouTube' }),
+					{ status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
+				);
+			}
+		}
+
+		// YouTube video metadata
+		if (url.pathname === '/api/youtube/metadata' && request.method === 'POST') {
+			try {
+				const body = await request.json() as { videoId?: string; playlistId?: string };
+				
+				if (!body.videoId && !body.playlistId) {
+					return new Response(
+						JSON.stringify({ error: 'videoId or playlistId is required' }),
+						{ status: 400, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
+					);
+				}
+
+				// Handle single video
+				if (body.videoId) {
+					const apiUrl = new URL('https://www.googleapis.com/youtube/v3/videos');
+					apiUrl.searchParams.set('part', 'snippet,contentDetails');
+					apiUrl.searchParams.set('id', body.videoId);
+					apiUrl.searchParams.set('key', env.YOUTUBE_API_KEY);
+
+					const response = await fetch(apiUrl.toString());
+					const data = await response.json() as any;
+
+					if (!response.ok || !data.items || data.items.length === 0) {
+						throw new Error('Video not found');
+					}
+
+					const item = data.items[0];
+					const duration = parseDuration(item.contentDetails.duration);
+
+					return new Response(
+						JSON.stringify({
+							videoId: item.id,
+							title: item.snippet.title,
+							thumbnail: item.snippet.thumbnails.medium.url,
+							duration,
+							channelTitle: item.snippet.channelTitle,
+						}),
+						{ headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
+					);
+				}
+
+				// Handle playlist
+				if (body.playlistId) {
+					const playlistUrl = new URL('https://www.googleapis.com/youtube/v3/playlistItems');
+					playlistUrl.searchParams.set('part', 'snippet');
+					playlistUrl.searchParams.set('playlistId', body.playlistId);
+					playlistUrl.searchParams.set('maxResults', '50');
+					playlistUrl.searchParams.set('key', env.YOUTUBE_API_KEY);
+
+					const response = await fetch(playlistUrl.toString());
+					const data = await response.json() as any;
+
+					if (!response.ok) {
+						throw new Error('Playlist not found');
+					}
+
+					const videoIds = data.items.map((item: any) => item.snippet.resourceId.videoId).join(',');
+					
+					// Get video details
+					const detailsUrl = new URL('https://www.googleapis.com/youtube/v3/videos');
+					detailsUrl.searchParams.set('part', 'snippet,contentDetails');
+					detailsUrl.searchParams.set('id', videoIds);
+					detailsUrl.searchParams.set('key', env.YOUTUBE_API_KEY);
+
+					const detailsResponse = await fetch(detailsUrl.toString());
+					const detailsData = await detailsResponse.json() as any;
+
+					const videos = detailsData.items.map((item: any) => ({
+						videoId: item.id,
+						title: item.snippet.title,
+						thumbnail: item.snippet.thumbnails.medium.url,
+						duration: parseDuration(item.contentDetails.duration),
+						channelTitle: item.snippet.channelTitle,
+					}));
+
+					return new Response(
+						JSON.stringify({ videos }),
+						{ headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
+					);
+				}
+			} catch (error) {
+				return new Response(
+					JSON.stringify({ error: 'Failed to fetch YouTube metadata' }),
+					{ status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
+				);
+			}
+		}
+
+		return new Response('Not found', { status: 404, headers: corsHeaders });
+	},
+} satisfies ExportedHandler<Env>;
+
+// Parse ISO 8601 duration to seconds
+function parseDuration(duration: string): number {
+	const match = duration.match(/PT(?:(\d+)H)?(?:(\d+)M)?(?:(\d+)S)?/);
+	if (!match) return 0;
+	
+	const hours = parseInt(match[1] || '0');
+	const minutes = parseInt(match[2] || '0');
+	const seconds = parseInt(match[3] || '0');
+	
+	return hours * 3600 + minutes * 60 + seconds;
+}
